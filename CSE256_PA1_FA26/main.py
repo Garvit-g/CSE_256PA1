@@ -12,7 +12,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from BOWmodels import SentimentDatasetBOW, NN2BOW, NN3BOW
 from sentiment_data import read_word_embeddings
-from DANmodels import SentimentDatasetDAN, DAN, INIT_SCHEMES
+from DANmodels import SentimentDatasetDAN, SentimentDatasetSubwordDAN, DAN, INIT_SCHEMES
+from bpe import BPETokenizer
 
 
 # Training function
@@ -122,7 +123,7 @@ def main():
 
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Run model training based on specified model type')
-    parser.add_argument('--model', type=str, required=True, help='Model type to train (BOW or DAN)')
+    parser.add_argument('--model', type=str, required=True, help='Model type to train (BOW, DAN or SUBWORDDAN)')
     # DAN hyperparameters (defaults = best configuration found)
     parser.add_argument('--emb', type=str, default='300', choices=['50', '300'], help='GloVe embedding dimension')
     parser.add_argument('--hidden', type=int, default=300, help='Hidden layer size')
@@ -144,12 +145,20 @@ def main():
                         help='Learning rate (default depends on optimizer: 1e-3 Adam/AdamW/RMSprop, 1e-2 Adagrad, 5e-2 SGD)')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='L2 weight decay (AdamW uses 0.01 if not set)')
     parser.add_argument('--momentum', type=float, default=0.9, help='Momentum (SGD only)')
-    parser.add_argument('--epochs', type=int, default=10, help='Training epochs')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Training epochs (default: 10 for DAN, 20 for SUBWORDDAN)')
+    # Part 2: subword (BPE) DAN
+    parser.add_argument('--vocab_size', type=int, default=5000,
+                        help='SUBWORDDAN: BPE vocabulary size (base characters + merges)')
+    parser.add_argument('--subword_emb_dim', type=int, default=300,
+                        help='SUBWORDDAN: dimension of the randomly initialised subword embeddings')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
     # Parse the command-line arguments
     args = parser.parse_args()
+    if args.epochs is None:
+        args.epochs = 20 if args.model == 'SUBWORDDAN' else 10
     if args.lr is None:
         args.lr = DEFAULT_LR[args.optimizer]
     torch.manual_seed(args.seed)
@@ -242,6 +251,56 @@ def main():
         plot_curves(dan_train_accuracy, dan_test_accuracy,
                     f'DAN ({args.emb}d {emb_source}, {args.activation}, {args.optimizer}) Train/Dev Accuracy',
                     f'dan_accuracy_{"random" if args.random_init else "glove"}_{args.activation}_{args.optimizer}.png')
+    elif args.model == "SUBWORDDAN":
+        # 1. Learn BPE merges on the training set only
+        start_time = time.time()
+        bpe = BPETokenizer(args.vocab_size).train_from_file("data/train.txt")
+        bpe_time = time.time() - start_time
+        print(f"BPE trained in {bpe_time:.1f} seconds: {len(bpe.vocab)} subword types "
+              f"({len(bpe.merges)} merges) + PAD/UNK")
+        example = "This unwatchable movie is surprisingly heartfelt .".split()
+        print(f"Example tokenization: {bpe.encode(example)}")
+
+        # 2. Encode train/dev into padded subword index tensors
+        start_time = time.time()
+        train_data = SentimentDatasetSubwordDAN("data/train.txt", bpe)
+        dev_data = SentimentDatasetSubwordDAN("data/dev.txt", bpe)
+        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+        test_loader = DataLoader(dev_data, batch_size=args.batch_size, shuffle=False)
+        print(f"Data encoded in {time.time() - start_time:.1f} seconds; average tokens per sentence: "
+              f"train {train_data.avg_tokens:.1f}, dev {dev_data.avg_tokens:.1f}")
+
+        # 3. Same DAN, but with randomly initialised subword embeddings
+        model = DAN(None, vocab_size=bpe.vocab_len(), emb_dim=args.subword_emb_dim,
+                    hidden_size=args.hidden, num_layers=args.layers, dropout=args.dropout,
+                    word_dropout=args.word_dropout, activation=args.activation,
+                    emb_dropout=args.emb_dropout, init=args.init)
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f'\nSubword DAN (BPE vocab {args.vocab_size}, {args.subword_emb_dim}d random-init, '
+              f'{args.layers} hidden layers of {args.hidden}, emb dropout {args.emb_dropout}, '
+              f'hidden dropout {args.dropout}, token dropout {args.word_dropout}, activation {args.activation}, '
+              f'init {args.init}, optimizer {args.optimizer}, lr {args.lr}, {num_params:,} parameters):')
+
+        start_time = time.time()
+        sub_train_accuracy, sub_test_accuracy = experiment(model, train_loader, test_loader,
+                                                           lr=args.lr, epochs=args.epochs, print_every=1,
+                                                           optimizer_name=args.optimizer,
+                                                           weight_decay=args.weight_decay,
+                                                           momentum=args.momentum)
+        train_time = time.time() - start_time
+        best_epoch = max(range(len(sub_test_accuracy)), key=lambda i: sub_test_accuracy[i])
+        print(f"\nBest dev accuracy {sub_test_accuracy[best_epoch]:.3f} at epoch {best_epoch + 1}; "
+              f"final dev accuracy {sub_test_accuracy[-1]:.3f}")
+        print(f"Training time: {train_time:.1f} seconds ({train_time / args.epochs:.1f} s/epoch); "
+              f"BPE training time: {bpe_time:.1f} seconds\n")
+
+        plot_curves(sub_train_accuracy, sub_test_accuracy,
+                    f'Subword DAN (BPE vocab {args.vocab_size}) Train/Dev Accuracy',
+                    f'subword_dan_accuracy_v{args.vocab_size}.png')
+
+    else:
+        print(f"Unknown model type: {args.model}. Use BOW, DAN or SUBWORDDAN.")
+
 
 if __name__ == "__main__":
     main()

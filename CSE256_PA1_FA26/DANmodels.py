@@ -41,6 +41,30 @@ class SentimentDatasetDAN(Dataset):
         return self.embeddings[idx], self.labels[idx]
 
 
+
+class SentimentDatasetSubwordDAN(Dataset):
+    """
+    Part 2: each sentence becomes a padded tensor of BPE subword indices.
+    The tokenizer must already be trained (on train.txt only).
+    """
+    def __init__(self, infile, bpe):
+        self.examples = read_sentiment_examples(infile)
+        index_lists = [bpe.encode_ids(ex.words) for ex in self.examples]
+
+        # Pad every sentence with PAD (0) to the same length
+        max_len = max(len(idxs) for idxs in index_lists)
+        padded = [idxs + [0] * (max_len - len(idxs)) for idxs in index_lists]
+
+        self.embeddings = torch.tensor(padded, dtype=torch.long)
+        self.labels = torch.tensor([ex.label for ex in self.examples], dtype=torch.long)
+        self.avg_tokens = sum(len(idxs) for idxs in index_lists) / len(index_lists)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.embeddings[idx], self.labels[idx]
+
 # Nonlinearities that can be used between the hidden layers
 ACTIVATIONS = {
     'relu': nn.ReLU,
@@ -88,18 +112,28 @@ class DAN(nn.Module):
     """
     def __init__(self, word_embeddings, hidden_size=300, num_layers=2, dropout=0.2,
                  word_dropout=0.3, freeze=False, activation='relu', emb_dropout=0.0,
-                 init='default', random_init=False):
+                 init='default', random_init=False, vocab_size=None, emb_dim=None):
+        """
+        word_embeddings: GloVe WordEmbeddings for word-level models (Parts 1a/1b).
+                         Pass None for the subword model (Part 2) and give vocab_size and
+                         emb_dim instead; embeddings are then always randomly initialised.
+        """
         super().__init__()
         self.pad_idx = 0
         self.word_dropout = word_dropout
 
-        emb_dim = word_embeddings.get_embedding_length()
+        if word_embeddings is not None:
+            vocab_size = len(word_embeddings.word_indexer)
+            emb_dim = word_embeddings.get_embedding_length()
+        else:
+            # Part 2: BPE subwords have no pretrained vectors
+            random_init = True
+
         if random_init:
-            # Part 1b: randomly initialised embeddings, learned from scratch.
-            # The GloVe file is used only for its vocabulary (word -> index) and dimension;
+            # Parts 1b and 2: randomly initialised embeddings, learned from scratch.
+            # For 1b the GloVe file is used only for its vocabulary (word -> index) and dimension;
             # none of its vectors are used. nn.Embedding draws each vector from N(0, 1),
             # and the PAD row (index 0) is fixed at zero and never updated.
-            vocab_size = len(word_embeddings.word_indexer)
             self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=self.pad_idx)
         else:
             # Part 1a: embedding layer initialised with pretrained GloVe vectors (50d or 300d)
